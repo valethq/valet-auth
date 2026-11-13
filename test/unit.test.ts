@@ -1,0 +1,377 @@
+import { Database } from "bun:sqlite";
+import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type {
+  AuthResult,
+  BeforeEvent,
+  PluginContext,
+  PluginEventBus,
+  PluginStorage,
+  Principal,
+  RequestContext,
+  Role,
+  RouteHandler,
+  ScopeRegistry,
+  Store,
+  ValetEvents,
+} from "@valethq/sdk";
+import { MIGRATIONS, createAuthStore } from "../src/db";
+import plugin, { type AuthConfig } from "../src/index";
+import { clearCookie, parseCookies, randomSecret, sessionCookie, sha256Hex } from "../src/secrets";
+
+// ---- pure helpers -----------------------------------------------------------
+
+describe("secrets", () => {
+  test("randomSecret is 32 bytes base64url and unique", () => {
+    const a = randomSecret();
+    const b = randomSecret();
+    expect(a).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(a).not.toBe(b);
+  });
+
+  test("sha256Hex is a stable hex digest", () => {
+    expect(sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+  });
+
+  test("parseCookies handles standard headers", () => {
+    expect(parseCookies("a=1; b=2;valet_session=x.y-z")).toEqual({
+      a: "1",
+      b: "2",
+      valet_session: "x.y-z",
+    });
+    expect(parseCookies(null)).toEqual({});
+    expect(parseCookies("k=v=with=equals")).toEqual({ k: "v=with=equals" });
+    expect(parseCookies(";; =dropped; ok=1")).toEqual({ ok: "1" });
+  });
+
+  test("sessionCookie shape and Secure flag", () => {
+    const plain = sessionCookie("valet_session", "s3cr3t", false);
+    expect(plain).toBe("valet_session=s3cr3t; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000");
+    expect(sessionCookie("valet_session", "s3cr3t", true)).toContain("; Secure");
+    expect(clearCookie("valet_session", false)).toContain("Max-Age=0");
+  });
+
+  test("argon2id hash round-trips and rejects a wrong password", async () => {
+    const hash = await Bun.password.hash("hunter2", "argon2id");
+    expect(hash).toContain("$argon2id$");
+    expect(await Bun.password.verify("hunter2", hash)).toBe(true);
+    expect(await Bun.password.verify("nope", hash)).toBe(false);
+  });
+});
+
+// ---- db layer ---------------------------------------------------------------
+
+describe("auth store", () => {
+  const newStore = () => {
+    const db = new Database(":memory:");
+    for (const m of MIGRATIONS) db.exec(m.up);
+    return createAuthStore(db);
+  };
+
+  test("owner create/read and single setup token", () => {
+    const s = newStore();
+    expect(s.owner()).toBeUndefined();
+    s.setSetupToken("hash-a");
+    expect(s.checkSetupToken("hash-a")).toBe(true);
+    s.setSetupToken("hash-b"); // rotates: only one setup token at a time
+    expect(s.checkSetupToken("hash-a")).toBe(false);
+    s.createOwner("pri_1", "$argon2id$x");
+    expect(s.owner()?.principalId).toBe("pri_1");
+    s.clearSetupTokens();
+    expect(s.checkSetupToken("hash-b")).toBe(false);
+  });
+
+  test("devices and tokens: lookup by secret, touch, revoke, list", () => {
+    const s = newStore();
+    const dev = s.createDevice("pri_1", "dhash", "laptop");
+    expect(s.deviceBySecret("dhash")?.id).toBe(dev.id);
+    s.touchDevice(dev.id);
+    expect(s.deviceBySecret("dhash")?.lastSeenAt).not.toBeNull();
+    expect(s.revokeDevice(dev.id)).toBe(true);
+    expect(s.revokeDevice(dev.id)).toBe(false); // already revoked
+    expect(s.deviceBySecret("dhash")?.revokedAt).not.toBeNull();
+
+    const tok = s.createToken("pri_1", "thash", "cli");
+    expect(s.tokenBySecret("thash")?.id).toBe(tok.id);
+    expect(s.listTokens()).toHaveLength(1);
+    expect(s.listDevices()).toHaveLength(1);
+    expect(s.revokeToken(tok.id)).toBe(true);
+  });
+});
+
+// ---- plugin wiring over a fake PluginContext ---------------------------------
+
+interface Fake {
+  ctx: PluginContext<AuthConfig>;
+  routes: Map<string, { handler: RouteHandler; public: boolean }>;
+  authenticate: (req: Request) => AuthResult | undefined | Promise<AuthResult | undefined>;
+  controlRequest: (e: BeforeEvent<"control.request", ValetEvents["control.request"]>) => unknown;
+  logs: { msg: string; data?: Record<string, unknown> }[];
+  principals: Map<string, Principal>;
+  dataDir: string;
+}
+
+function fakeContext(config: Record<string, unknown> = {}): Fake {
+  const dataDir = mkdtempSync(join(tmpdir(), "valet-auth-test-"));
+  const db = new Database(":memory:");
+  const routes: Fake["routes"] = new Map();
+  const logs: Fake["logs"] = [];
+  const principals = new Map<string, Principal>();
+  const events: { name: string; fn: (e: never) => unknown }[] = [];
+  let authenticate: Fake["authenticate"] = () => undefined;
+
+  const principalByExternal = new Map<string, Principal>();
+  const store = {
+    principals: {
+      get: (id: string) => principals.get(id),
+      resolveIdentity: (platform: string, externalId: string, fallback?: { displayName: string }) => {
+        const key = `${platform}:${externalId}`;
+        const existing = principalByExternal.get(key);
+        if (existing) return existing;
+        const p: Principal = {
+          id: `pri_${principalByExternal.size + 1}`,
+          displayName: fallback?.displayName ?? externalId,
+          role: "guest",
+        };
+        principalByExternal.set(key, p);
+        principals.set(p.id, p);
+        return p;
+      },
+      setRole: async (id: string, role: Role) => {
+        const p = principals.get(id);
+        if (!p) throw new Error(`unknown principal "${id}"`);
+        principals.set(id, { ...p, role });
+      },
+      link: async () => {},
+    },
+  } as unknown as Store;
+
+  const ctx = {
+    plugin: { id: "valet-auth", version: "0.1.0", dir: dataDir, manifest: {} },
+    config,
+    log: {
+      debug: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
+      info: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
+      warn: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
+      error: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
+    },
+    events: {
+      before: (name: string, fn: (e: never) => unknown) => {
+        events.push({ name, fn });
+        return { active: true, disconnect: () => {} };
+      },
+    } as unknown as PluginEventBus,
+    scopes: {
+      provide: (_scope: string, impl: { authenticate: Fake["authenticate"] }) => {
+        authenticate = impl.authenticate.bind(impl);
+        return { dispose: () => {} };
+      },
+    } as unknown as ScopeRegistry,
+    store,
+    storage: {
+      kv: {
+        get: () => undefined,
+        set: () => {},
+        delete: () => {},
+        list: () => [],
+      },
+      sql: {
+        migrate: (ms: { id: string; up: string }[]) => {
+          for (const m of ms) db.exec(m.up);
+        },
+        db,
+      },
+    } satisfies PluginStorage,
+    http: {
+      route: (method: string, path: string, handler: RouteHandler, opts?: { public?: boolean }) => {
+        routes.set(`${method} ${path}`, { handler, public: opts?.public ?? false });
+        return { dispose: () => {} };
+      },
+      url: (path: string) => `http://127.0.0.1:7417/plugins/valet-auth${path}`,
+    },
+    ws: { handle: () => ({ dispose: () => {} }), publish: () => {} },
+    secrets: { get: async () => undefined, require: async () => "x" },
+    paths: { data: dataDir, cache: dataDir, valetHome: dataDir },
+    signal: new AbortController().signal,
+    onDispose: () => {},
+  } as unknown as PluginContext<AuthConfig>;
+
+  return {
+    ctx,
+    routes,
+    authenticate: (req) => authenticate(req),
+    controlRequest: (e) => {
+      const hook = events.find((h) => h.name === "control.request");
+      if (!hook) throw new Error("no control.request hook registered");
+      return hook.fn(e as never);
+    },
+    logs,
+    principals,
+    dataDir,
+  };
+}
+
+const ownerCtx = (principalId: string): RequestContext => ({
+  caller: { plugin: "core", actor: { principalId, role: "owner" } },
+  principal: { id: principalId, displayName: "o", role: "owner" },
+  params: {},
+  url: new URL("http://127.0.0.1:7417/"),
+});
+
+const call = (f: Fake, key: string, req: Request, rc?: RequestContext) => {
+  const route = f.routes.get(key);
+  if (!route) throw new Error(`route ${key} not registered`);
+  return route.handler(req, rc ?? ownerCtx("pri_1"));
+};
+
+// A Set-Cookie value happens to parse like a Cookie header; attributes just look like extra pairs.
+const cookieOf = (res: Response, name = "valet_session"): string =>
+  parseCookies(res.headers.get("set-cookie"))[name] ?? "";
+
+describe("plugin", () => {
+  test("mints a setup token on first boot and logs the setup URL", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const tokenFile = join(f.dataDir, "setup-token");
+    const token = readFileSync(tokenFile, "utf8");
+    expect(token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+    const log = f.logs.find((l) => l.msg === "valet-auth setup");
+    expect(log?.data?.url).toBe(`http://127.0.0.1:7417/plugins/valet-auth/setup?token=${token}`);
+    const status = await call(f, "GET /status", new Request("http://x/status"));
+    expect(await status.json()).toEqual({ setupRequired: true });
+  });
+
+  test("control.request policy: owner allowed, other roles denied, anonymous untouched", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const mk = (actor?: { principalId: string; role: Role }) => {
+      let denied: string | undefined;
+      const e = {
+        name: "control.request",
+        phase: "before",
+        caller: { plugin: "core", ...(actor ? { actor } : {}) },
+        payload: { kind: "http", method: "GET", path: "/" },
+        cancelled: false,
+        cancelReason: undefined,
+        denied: undefined,
+        cancel: () => {},
+        deny: (r: string) => {
+          denied = r;
+        },
+      } as unknown as BeforeEvent<"control.request", ValetEvents["control.request"]>;
+      f.controlRequest(e);
+      return denied;
+    };
+    expect(mk({ principalId: "p", role: "owner" })).toBeUndefined();
+    expect(mk({ principalId: "p", role: "trusted" })).toBe("valet-auth: owner only on the control plane");
+    expect(mk({ principalId: "p", role: "guest" })).toBe("valet-auth: owner only on the control plane");
+    expect(mk(undefined)).toBeUndefined();
+  });
+
+  test("setup, login cookie auth, logout revoke, bearer tokens", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const setupToken = readFileSync(join(f.dataDir, "setup-token"), "utf8");
+
+    const bad = await call(
+      f,
+      "POST /setup",
+      new Request("http://x/setup", {
+        method: "POST",
+        body: JSON.stringify({ token: "wrong", password: "pw123456" }),
+      }),
+    );
+    expect(bad.status).toBe(401);
+
+    const res = await call(
+      f,
+      "POST /setup",
+      new Request("http://x/setup", {
+        method: "POST",
+        body: JSON.stringify({ token: setupToken, password: "pw123456", displayName: "A" }),
+      }),
+    );
+    expect(res.status).toBe(200);
+    const { principalId } = (await res.json()) as { principalId: string };
+    const cookie = cookieOf(res);
+    expect(cookie).not.toBe("");
+    expect(res.headers.get("set-cookie")).toContain("SameSite=Strict");
+    expect(f.principals.get(principalId)?.role).toBe("owner");
+
+    const authReq = (headers: Record<string, string>) => new Request("http://x/", { headers });
+    expect(await f.authenticate(authReq({ cookie: `valet_session=${cookie}` }))).toEqual({
+      principalId,
+      credentialId: expect.stringMatching(/^dev_/),
+    });
+    expect(await f.authenticate(authReq({ cookie: "valet_session=bogus" }))).toBeUndefined();
+
+    // owner routes
+    const me = await call(f, "GET /me", authReq({}), ownerCtx(principalId));
+    expect(((await me.json()) as { principal: { role: string } }).principal.role).toBe("owner");
+
+    // bearer token lifecycle
+    const tokRes = await call(
+      f,
+      "POST /tokens",
+      new Request("http://x/tokens", { method: "POST", body: JSON.stringify({ name: "cli" }) }),
+      ownerCtx(principalId),
+    );
+    expect(tokRes.status).toBe(201);
+    const { id: tokenId, token } = (await tokRes.json()) as { id: string; token: string };
+    expect(await f.authenticate(authReq({ authorization: `Bearer ${token}` }))).toEqual({
+      principalId,
+      credentialId: tokenId,
+    });
+    const delTok = await call(f, "DELETE /tokens/:id", authReq({}), {
+      ...ownerCtx(principalId),
+      params: { id: tokenId },
+    });
+    expect(delTok.status).toBe(200);
+    expect(await f.authenticate(authReq({ authorization: `Bearer ${token}` }))).toBeUndefined();
+
+    // logout revokes the device
+    const out = await call(f, "POST /logout", authReq({ cookie: `valet_session=${cookie}` }));
+    expect(out.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect(await f.authenticate(authReq({ cookie: `valet_session=${cookie}` }))).toBeUndefined();
+  });
+
+  test("login rejects a wrong password and authenticates a right one", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const setupToken = readFileSync(join(f.dataDir, "setup-token"), "utf8");
+    await call(
+      f,
+      "POST /setup",
+      new Request("http://x/setup", {
+        method: "POST",
+        body: JSON.stringify({ token: setupToken, password: "pw123456" }),
+      }),
+    );
+
+    const t0 = Date.now();
+    const wrong = await call(
+      f,
+      "POST /login",
+      new Request("http://x/login", { method: "POST", body: JSON.stringify({ password: "no" }) }),
+    );
+    expect(wrong.status).toBe(401);
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(290);
+
+    const right = await call(
+      f,
+      "POST /login",
+      new Request("http://x/login", {
+        method: "POST",
+        body: JSON.stringify({ password: "pw123456", deviceName: "phone" }),
+      }),
+    );
+    expect(right.status).toBe(200);
+    const devices = (await (
+      await call(f, "GET /devices", new Request("http://x/d"), ownerCtx("pri_1"))
+    ).json()) as { devices: { name: string | null }[] };
+    expect(devices.devices.map((d) => d.name)).toContain("phone");
+  });
+});
