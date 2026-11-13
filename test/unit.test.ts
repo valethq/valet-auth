@@ -112,6 +112,7 @@ interface Fake {
   emits: { name: string; payload: unknown }[];
   principals: Map<string, Principal>;
   dataDir: string;
+  reconfigure: (next: AuthConfig) => Promise<void>;
 }
 
 function fakeContext(config: Record<string, unknown> = {}): Fake {
@@ -123,6 +124,7 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
   const events: { name: string; fn: (e: never) => unknown }[] = [];
   const emits: Fake["emits"] = [];
   let authenticate: Fake["authenticate"] = () => undefined;
+  const listeners: ((next: AuthConfig, prev: AuthConfig) => void | Promise<void>)[] = [];
 
   const principalByExternal = new Map<string, Principal>();
   const store = {
@@ -201,6 +203,7 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
     secrets: { get: async () => undefined, require: async () => "x" },
     paths: { data: dataDir, cache: dataDir, valetHome: dataDir },
     signal: new AbortController().signal,
+    onConfigChange: (fn: (typeof listeners)[number]) => listeners.push(fn),
     onDispose: () => {},
   } as unknown as PluginContext<AuthConfig>;
 
@@ -217,6 +220,11 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
     emits,
     principals,
     dataDir,
+    reconfigure: async (next) => {
+      const prev = ctx.config;
+      (ctx as { config: AuthConfig }).config = next;
+      for (const fn of listeners) await fn(next, prev);
+    },
   };
 }
 
@@ -410,5 +418,25 @@ describe("plugin", () => {
       await call(f, "GET /devices", new Request("http://x/d"), ownerCtx("pri_1"))
     ).json()) as { devices: { name: string | null }[] };
     expect(devices.devices.map((d) => d.name)).toContain("phone");
+  });
+
+  test("a reloaded cookieName applies to the next login", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const setupToken = readFileSync(join(f.dataDir, "setup-token"), "utf8");
+    const setup = (): Request =>
+      new Request("http://x/setup", {
+        method: "POST",
+        body: JSON.stringify({ token: setupToken, password: "pw123456" }),
+      });
+    await call(f, "POST /setup", setup());
+    await f.reconfigure({ cookieName: "renamed" });
+    const login = await call(
+      f,
+      "POST /login",
+      new Request("http://x/login", { method: "POST", body: JSON.stringify({ password: "pw123456" }) }),
+    );
+    expect(cookieOf(login, "renamed")).not.toBe("");
+    expect(cookieOf(login)).toBe("");
   });
 });

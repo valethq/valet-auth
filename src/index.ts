@@ -37,7 +37,10 @@ async function jsonBody(req: Request): Promise<Record<string, unknown>> {
 
 export default definePlugin<AuthConfig>({
   async activate(ctx: PluginContext<AuthConfig>) {
-    const cookieName = ctx.config.cookieName ?? "valet_session";
+    let cookieName = ctx.config.cookieName ?? "valet_session";
+    ctx.onConfigChange((next) => {
+      cookieName = next.cookieName ?? "valet_session";
+    });
     const tokenFile = join(ctx.paths.data, "setup-token");
     ctx.storage.sql.migrate(MIGRATIONS);
     const store = createAuthStore(ctx.storage.sql.db);
