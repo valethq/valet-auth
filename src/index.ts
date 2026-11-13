@@ -9,6 +9,7 @@ import {
 } from "@valethq/sdk";
 import { MIGRATIONS, createAuthStore } from "./db";
 import { clearCookie, parseCookies, randomSecret, sessionCookie, sha256Hex } from "./secrets";
+import { registerSettings } from "./settings";
 
 export interface AuthConfig {
   cookieName?: string;
@@ -213,6 +214,8 @@ export default definePlugin<AuthConfig>({
         return undefined;
       },
     });
+
+    registerSettings(ctx, store);
 
     // ---- default control-plane policy (11.7): owner only -----------------------
 

@@ -132,6 +132,12 @@ export function createAuthStore(db: Database) {
         Date.now(),
       );
     },
+    setPassword(principalId: string, passwordHash: string): void {
+      db.query("UPDATE p_auth_owner SET password_hash = ? WHERE principal_id = ?").run(
+        passwordHash,
+        principalId,
+      );
+    },
 
     checkSetupToken(tokenSha256: string): boolean {
       return (

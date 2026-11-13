@@ -172,8 +172,11 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
       },
     } as unknown as PluginEventBus,
     scopes: {
-      provide: (_scope: string, impl: { authenticate: Fake["authenticate"] }) => {
-        authenticate = impl.authenticate.bind(impl);
+      define: () => {},
+      provide: (scope: string, impl: { authenticate?: Fake["authenticate"] }) => {
+        if (scope === "identity" && impl.authenticate !== undefined) {
+          authenticate = impl.authenticate.bind(impl);
+        }
         return { dispose: () => {} };
       },
     } as unknown as ScopeRegistry,

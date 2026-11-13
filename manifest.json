@@ -6,7 +6,7 @@
   "description": "Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.",
   "valet": "^0.1.0",
   "main": "./src/index.ts",
-  "provides": ["identity@1"],
+  "provides": ["identity@1", "settings@1"],
   "events": { "namespace": "identity" },
   "configSchema": {
     "type": "object",
