@@ -109,6 +109,7 @@ interface Fake {
   authenticate: (req: Request) => AuthResult | undefined | Promise<AuthResult | undefined>;
   controlRequest: (e: BeforeEvent<"control.request", ValetEvents["control.request"]>) => unknown;
   logs: { msg: string; data?: Record<string, unknown> }[];
+  emits: { name: string; payload: unknown }[];
   principals: Map<string, Principal>;
   dataDir: string;
 }
@@ -120,6 +121,7 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
   const logs: Fake["logs"] = [];
   const principals = new Map<string, Principal>();
   const events: { name: string; fn: (e: never) => unknown }[] = [];
+  const emits: Fake["emits"] = [];
   let authenticate: Fake["authenticate"] = () => undefined;
 
   const principalByExternal = new Map<string, Principal>();
@@ -161,6 +163,10 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
       before: (name: string, fn: (e: never) => unknown) => {
         events.push({ name, fn });
         return { active: true, disconnect: () => {} };
+      },
+      emit: async (name: string, payload: unknown) => {
+        emits.push({ name, payload });
+        return { payload, cancelled: false };
       },
     } as unknown as PluginEventBus,
     scopes: {
@@ -208,6 +214,7 @@ function fakeContext(config: Record<string, unknown> = {}): Fake {
       return hook.fn(e as never);
     },
     logs,
+    emits,
     principals,
     dataDir,
   };
@@ -336,6 +343,36 @@ describe("plugin", () => {
     const out = await call(f, "POST /logout", authReq({ cookie: `valet_session=${cookie}` }));
     expect(out.headers.get("set-cookie")).toContain("Max-Age=0");
     expect(await f.authenticate(authReq({ cookie: `valet_session=${cookie}` }))).toBeUndefined();
+  });
+
+  test("logout emits identity.changed once with the principal id", async () => {
+    const f = fakeContext();
+    await plugin.activate(f.ctx);
+    const setupToken = readFileSync(join(f.dataDir, "setup-token"), "utf8");
+    const res = await call(
+      f,
+      "POST /setup",
+      new Request("http://x/setup", {
+        method: "POST",
+        body: JSON.stringify({ token: setupToken, password: "pw123456" }),
+      }),
+    );
+    const { principalId } = (await res.json()) as { principalId: string };
+    const cookie = cookieOf(res);
+    f.emits.length = 0; // setup itself emits once
+
+    const out = await call(
+      f,
+      "POST /logout",
+      new Request("http://x/logout", { headers: { cookie: `valet_session=${cookie}` } }),
+    );
+    expect(out.status).toBe(200);
+    expect(f.emits).toEqual([{ name: "identity.changed", payload: { principalId } }]);
+
+    // no device cookie -> no revoke -> no emit
+    const bare = await call(f, "POST /logout", new Request("http://x/logout"));
+    expect(bare.status).toBe(200);
+    expect(f.emits).toHaveLength(1);
   });
 
   test("login rejects a wrong password and authenticates a right one", async () => {

@@ -88,6 +88,7 @@ export default definePlugin<AuthConfig>({
         store.createOwner(principal.id, await Bun.password.hash(password, "argon2id"));
         store.clearSetupTokens();
         rmSync(tokenFile, { force: true });
+        await ctx.events.emit("identity.changed", { principalId: principal.id });
         return issueSession(principal.id, new URL(req.url));
       },
       { public: true },
@@ -115,11 +116,13 @@ export default definePlugin<AuthConfig>({
     ctx.http.route(
       "POST",
       "/logout",
-      (req) => {
+      async (req) => {
         const secret = parseCookies(req.headers.get("cookie"))[cookieName];
         if (secret !== undefined && secret !== "") {
           const device = store.deviceBySecret(sha256Hex(secret));
-          if (device !== undefined) store.revokeDevice(device.id);
+          if (device !== undefined && store.revokeDevice(device.id)) {
+            await ctx.events.emit("identity.changed", { principalId: device.principalId });
+          }
         }
         const secure = new URL(req.url).protocol === "https:";
         return json({ ok: true }, 200, { "set-cookie": clearCookie(cookieName, secure) });
@@ -144,10 +147,15 @@ export default definePlugin<AuthConfig>({
       return p instanceof Response ? p : json({ devices: store.listDevices() });
     });
 
-    ctx.http.route("DELETE", "/devices/:id", (_req, rc) => {
+    ctx.http.route("DELETE", "/devices/:id", async (_req, rc) => {
       const p = requireOwner(rc);
       if (p instanceof Response) return p;
-      return store.revokeDevice(rc.params.id ?? "") ? json({ ok: true }) : error(404, "unknown device");
+      const device = store.deviceById(rc.params.id ?? "");
+      if (device === undefined || !store.revokeDevice(device.id)) {
+        return error(404, "unknown device");
+      }
+      await ctx.events.emit("identity.changed", { principalId: device.principalId });
+      return json({ ok: true });
     });
 
     ctx.http.route("POST", "/tokens", async (req, rc) => {
@@ -165,10 +173,15 @@ export default definePlugin<AuthConfig>({
       return p instanceof Response ? p : json({ tokens: store.listTokens() });
     });
 
-    ctx.http.route("DELETE", "/tokens/:id", (_req, rc) => {
+    ctx.http.route("DELETE", "/tokens/:id", async (_req, rc) => {
       const p = requireOwner(rc);
       if (p instanceof Response) return p;
-      return store.revokeToken(rc.params.id ?? "") ? json({ ok: true }) : error(404, "unknown token");
+      const token = store.tokenById(rc.params.id ?? "");
+      if (token === undefined || !store.revokeToken(token.id)) {
+        return error(404, "unknown token");
+      }
+      await ctx.events.emit("identity.changed", { principalId: token.principalId });
+      return json({ ok: true });
     });
 
     // ---- identity@1 ------------------------------------------------------------

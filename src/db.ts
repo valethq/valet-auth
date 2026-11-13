@@ -149,6 +149,7 @@ export function createAuthStore(db: Database) {
       db.query("DELETE FROM p_auth_setup").run();
     },
 
+    deviceById: (id: string) => optional(credential("devices", "id", id)),
     deviceBySecret: (h: string) => optional(credential("devices", "secret_sha256", h)),
     createDevice: (principalId: string, secretSha256: string, name?: string) =>
       createCredential("devices", principalId, secretSha256, name),
@@ -156,6 +157,7 @@ export function createAuthStore(db: Database) {
     revokeDevice: (id: string) => revokeCredential("devices", id),
     touchDevice: (id: string) => touch("devices", id),
 
+    tokenById: (id: string) => optional(credential("tokens", "id", id)),
     tokenBySecret: (h: string) => optional(credential("tokens", "secret_sha256", h)),
     createToken: (principalId: string, secretSha256: string, name?: string) =>
       createCredential("tokens", principalId, secretSha256, name),
