@@ -1,7 +1,7 @@
 {
   "schema": 1,
   "id": "valet-auth",
-  "name": "valet-auth",
+  "name": "Auth",
   "version": "0.1.0",
   "description": "Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.",
   "valet": "^0.1.0",
