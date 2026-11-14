@@ -13,8 +13,9 @@ import { join } from "node:path";
 import type { Subprocess } from "bun";
 import { parseCookies } from "../src/secrets";
 
-const CORE_CLI = "/home/user/valet/valet-core/packages/core/src/cli.ts";
-const SDK_DIR = "/home/user/valet/valet-core/packages/sdk";
+const CORE = process.env.VALET_CORE_DIR ?? join(import.meta.dir, "..", "..", "valet-core");
+const CORE_CLI = join(CORE, "packages/core/src/cli.ts");
+const SDK_DIR = join(CORE, "packages/sdk");
 const REPO = join(import.meta.dir, "..");
 const BUN = Bun.which("bun") ?? join(homedir(), ".npm-global/bin/bun");
 
