@@ -1,8 +1,11 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import type { PluginContext } from "@valethq/sdk";
+import type { PluginContext, SettingsPanel } from "@valethq/sdk";
 import { MIGRATIONS, createAuthStore } from "../src/db";
-import { registerSettings, type SettingsPanel } from "../src/settings";
+import { registerSettings } from "../src/settings";
+
+/** The panels under test have a form, so get and set are present. */
+type FormPanel = SettingsPanel & Required<Pick<SettingsPanel, "get" | "set">>;
 
 function setup() {
   const db = new Database(":memory:");
@@ -19,7 +22,7 @@ function setup() {
     },
   } as unknown as PluginContext;
   registerSettings(ctx, store);
-  return { store, panel: panels[0]?.impl as SettingsPanel };
+  return { store, panel: panels[0]?.impl as FormPanel };
 }
 
 test("password change verifies the current password and rehashes", async () => {

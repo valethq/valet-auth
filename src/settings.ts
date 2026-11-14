@@ -1,20 +1,6 @@
 import type { PluginContext } from "@valethq/sdk";
 import type { createAuthStore } from "./db";
 
-export interface SettingsPanel {
-  title: string;
-  description?: string;
-  schema: Record<string, unknown>;
-  get(): Record<string, unknown> | Promise<Record<string, unknown>>;
-  set(values: Record<string, unknown>): void | Promise<void>;
-}
-
-declare module "@valethq/sdk" {
-  interface ValetScopes {
-    settings: SettingsPanel;
-  }
-}
-
 type AuthStore = ReturnType<typeof createAuthStore>;
 
 export function registerSettings(ctx: PluginContext, store: AuthStore): void {
