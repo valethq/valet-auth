@@ -10,9 +10,15 @@
   "events": { "namespace": "identity" },
   "configSchema": {
     "type": "object",
+    "additionalProperties": false,
+    "x-group": "system",
     "properties": {
-      "cookieName": { "type": "string" }
-    },
-    "additionalProperties": false
+      "cookieName": {
+        "type": "string",
+        "title": "Session cookie name",
+        "description": "Name of the HTTP cookie that holds a device session. Change only if another cookie already uses the default.",
+        "default": "valet_session"
+      }
+    }
   }
 }

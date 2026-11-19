@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { PluginContext, SettingsPanel } from "@valethq/sdk";
 import { MIGRATIONS, createAuthStore } from "../src/db";
 import { registerSettings } from "../src/settings";
@@ -51,4 +53,19 @@ test("password change validates inputs", async () => {
   await expect(empty.set({ currentPassword: "x", newPassword: "new-password-1" })).rejects.toThrow(
     "no owner",
   );
+});
+
+test("cookieName is config; the Account panel stays a password form", () => {
+  const manifest = JSON.parse(readFileSync(join(import.meta.dir, "..", "manifest.json"), "utf8"));
+  const schema = manifest.configSchema;
+  expect(schema["x-group"]).toBe("system");
+  expect(schema.properties.cookieName).toMatchObject({
+    type: "string",
+    title: "Session cookie name",
+    default: "valet_session",
+  });
+  const { panel } = setup();
+  expect(panel.schema?.properties).toHaveProperty("currentPassword");
+  expect(panel.schema?.properties).toHaveProperty("newPassword");
+  expect(panel.schema?.properties).not.toHaveProperty("cookieName");
 });
