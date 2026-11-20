@@ -2,29 +2,30 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { PluginContext, SettingsPanel } from "@valethq/sdk";
+import type { PluginContext, RuntimeSubsection, SettingsContribution } from "@valethq/sdk";
 import { MIGRATIONS, createAuthStore } from "../src/db";
 import { registerSettings } from "../src/settings";
 
-/** The panels under test have a form, so get and set are present. */
-type FormPanel = SettingsPanel & Required<Pick<SettingsPanel, "get" | "set">>;
+/** The subsection under test is a form, so get and set are present. */
+type FormPanel = RuntimeSubsection & Required<Pick<RuntimeSubsection, "get" | "set">>;
 
 function setup() {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m.up);
   const store = createAuthStore(db);
-  const panels: { key?: string; impl: SettingsPanel }[] = [];
+  const panels: SettingsContribution[] = [];
   const ctx = {
     scopes: {
       define: () => {},
-      provide: (_s: string, impl: SettingsPanel, opts?: { key?: string }) => {
-        panels.push({ key: opts?.key, impl });
+      provide: (_s: string, impl: SettingsContribution) => {
+        panels.push(impl);
         return { dispose() {} };
       },
     },
   } as unknown as PluginContext;
   registerSettings(ctx, store);
-  return { store, panel: panels[0]?.impl as FormPanel };
+  const subs = panels[0]?.subsections?.() as RuntimeSubsection[];
+  return { store, panel: subs[0] as FormPanel };
 }
 
 test("password change verifies the current password and rehashes", async () => {
@@ -55,17 +56,17 @@ test("password change validates inputs", async () => {
   );
 });
 
-test("cookieName is config; the Account panel stays a password form", () => {
+test("cookieName is config; the Account subsection is a masked password form", () => {
   const manifest = JSON.parse(readFileSync(join(import.meta.dir, "..", "manifest.json"), "utf8"));
-  const schema = manifest.configSchema;
-  expect(schema["x-group"]).toBe("system");
-  expect(schema.properties.cookieName).toMatchObject({
-    type: "string",
-    title: "Session cookie name",
-    default: "valet_session",
+  expect(manifest.provides).toEqual(["identity@1", "settings@2"]);
+  const [cookie] = manifest.settings.sections.system.subsections[0].items;
+  expect(cookie).toMatchObject({
+    id: "cookieName",
+    label: "Session cookie name",
+    input: { type: "string", default: "valet_session" },
   });
   const { panel } = setup();
-  expect(panel.schema?.properties).toHaveProperty("currentPassword");
-  expect(panel.schema?.properties).toHaveProperty("newPassword");
-  expect(panel.schema?.properties).not.toHaveProperty("cookieName");
+  expect(panel.id).toBe("account");
+  expect(panel.items.map((i) => ("id" in i ? i.id : undefined))).toEqual(["currentPassword", "newPassword"]);
+  for (const item of panel.items) expect("input" in item && item.input.masked).toBe(true);
 });

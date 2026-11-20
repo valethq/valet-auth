@@ -6,18 +6,31 @@
   "description": "Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.",
   "valet": "^0.1.0",
   "main": "./src/index.ts",
-  "provides": ["identity@1", "settings@1"],
-  "events": { "namespace": "identity" },
-  "configSchema": {
-    "type": "object",
-    "additionalProperties": false,
-    "x-group": "system",
-    "properties": {
-      "cookieName": {
-        "type": "string",
-        "title": "Session cookie name",
-        "description": "Name of the HTTP cookie that holds a device session. Change only if another cookie already uses the default.",
-        "default": "valet_session"
+  "provides": ["identity@1", "settings@2"],
+  "events": {
+    "namespace": "identity"
+  },
+  "settings": {
+    "sections": {
+      "system": {
+        "subsections": [
+          {
+            "id": "sessions",
+            "label": "Sessions",
+            "items": [
+              {
+                "id": "cookieName",
+                "label": "Session cookie name",
+                "summary": "Name of the HTTP cookie that holds a device session. Change only if another cookie already uses the default.",
+                "input": {
+                  "type": "string",
+                  "default": "valet_session"
+                }
+              }
+            ]
+          }
+        ],
+        "icon": "lock"
       }
     }
   }
