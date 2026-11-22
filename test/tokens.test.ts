@@ -91,6 +91,36 @@ describe("token creation", () => {
     expect((await mint(f, { cap: ["core:session.read"] }, trusted)).status).toBe(403);
     expect((await mint(f, { cap: ["nobody:declared"] })).status).toBe(403);
   });
+
+  test("a dead issuer credential cannot mint, on any path", async () => {
+    const { f, principalId } = await boot();
+    const dead = ownerCtx(principalId, { credentialId: "dev_gone" });
+    expect((await mint(f, { cap: ["core:session.read"] }, dead)).status).toBe(403);
+    expect((await mint(f, { cap: ["*"] }, dead)).status).toBe(403);
+    expect((await mint(f, { tag: "ci" }, dead)).status).toBe(403);
+    const live = ownerCtx(principalId);
+    expect((await mint(f, { cap: ["*"] }, live)).status).toBe(201);
+  });
+
+  test("a scoped grant mints on its resource, nowhere else", async () => {
+    const { f, principalId } = await boot();
+    const policy = {
+      check: (_s: unknown, _p: string, resource?: { id: string }) =>
+        resource?.id === "project:prj_a"
+          ? { allow: true as const }
+          : { allow: false as const, by: "test", reason: "not granted" },
+    };
+    (f.ctx.scopes as { maybe: (n: string) => unknown }).maybe = () => policy;
+    const issuer = ownerCtx(principalId);
+    expect((await mint(f, { cap: ["core:session.read"] }, issuer)).status).toBe(403);
+    expect((await mint(f, { cap: ["core:session.read"], resource: "project:prj_a" }, issuer)).status).toBe(
+      201,
+    );
+    expect((await mint(f, { cap: ["core:session.read"], resource: "project:prj_b" }, issuer)).status).toBe(
+      403,
+    );
+    expect((await mint(f, { cap: ["core:session.read"], resource: "bogus" }, issuer)).status).toBe(400);
+  });
 });
 
 describe("tagged tokens", () => {

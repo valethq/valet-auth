@@ -1,4 +1,4 @@
-import { type AclContext, type Caller, can, matchPermission } from "@valethq/sdk";
+import { type AclContext, type Caller, can, matchPermission, type ResourceScope } from "@valethq/sdk";
 
 const PATTERN = /^(\*|[a-z][a-z0-9-]*:(\*|[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*))$/;
 const isWildcard = (pattern: string): boolean => pattern.endsWith("*");
@@ -16,8 +16,16 @@ export function checkPatterns(cap: string[]): CapProblem | undefined {
   return bad === undefined ? undefined : { status: 400, message: `invalid permission pattern "${bad}"` };
 }
 
-/** A capped token acts as its creator, so it may not exceed what the issuing caller holds. */
-export function checkIssuer(ctx: AclContext, caller: Caller, cap: string[]): CapProblem | undefined {
+/**
+ * A capped token acts as its creator, so it may not exceed what the issuing caller holds. `resource` scopes the
+ * check the way the minted token will be used; without it a grant that only covers one resource can never mint.
+ */
+export function checkIssuer(
+  ctx: AclContext,
+  caller: Caller,
+  cap: string[],
+  resource?: string | ResourceScope,
+): CapProblem | undefined {
   const issuer = caller.actor;
   const uncappedOwner = issuer?.role === "owner" && issuer.cap === undefined;
   for (const pattern of cap) {
@@ -27,7 +35,7 @@ export function checkIssuer(ctx: AclContext, caller: Caller, cap: string[]): Cap
     }
     if (issuer?.cap !== undefined && !issuer.cap.some((held) => matchPermission(held, pattern)))
       return { status: 403, message: `"${pattern}" exceeds the issuing credential` };
-    const decision = can(ctx, caller, pattern);
+    const decision = can(ctx, caller, pattern, resource);
     if (!decision.allow) return { status: 403, message: decision.reason };
   }
   return undefined;

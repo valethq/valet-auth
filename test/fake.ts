@@ -74,6 +74,7 @@ export function fakeContext(config: Record<string, unknown> = {}): Fake {
       },
       link: async () => {},
     },
+    sessions: { get: () => undefined },
   } as unknown as Store;
 
   const ctx = {

@@ -1,4 +1,4 @@
-import { type PluginContext, type RouteHandler, can } from "@valethq/sdk";
+import { type PluginContext, type RouteHandler, can, sessionResource } from "@valethq/sdk";
 import { checkIssuer, checkPatterns, validTag } from "./caps";
 import type { AuthStore } from "./db";
 import { error, json, jsonBody } from "./respond";
@@ -14,17 +14,30 @@ export function createToken(ctx: PluginContext, store: AuthStore): RouteHandler 
     const name = typeof b.name === "string" && b.name !== "" ? b.name : undefined;
     const cap = b.cap;
     const tag = b.tag;
+    const resource = b.resource;
     if (cap !== undefined && (!Array.isArray(cap) || !cap.every((p) => typeof p === "string")))
       return error(400, "cap must be an array of permission patterns");
     if (tag !== undefined && (typeof tag !== "string" || !validTag(tag)))
       return error(400, "tag must be a tag name without the tag: prefix");
+    if (resource !== undefined && (typeof resource !== "string" || !/^[a-z][a-z0-9-]*:.+$/.test(resource)))
+      return error(400, "resource must be a <kind>:<id> string");
     if (cap === undefined && tag === undefined) return error(400, "cap or tag is required");
 
     const bad = cap === undefined ? undefined : checkPatterns(cap as string[]);
     if (bad !== undefined) return error(bad.status, bad.message);
 
+    // `can` checks credential liveness on the paths that call it; the wildcard and no-policy tag paths do not.
+    const credentialId = rc.caller.credentialId;
+    if (credentialId !== undefined && ctx.acl.credential(credentialId)?.active !== true)
+      return error(403, "credential is not active");
+
     if (tag === undefined) {
-      const problem = checkIssuer(ctx, rc.caller, cap as string[]);
+      // A claimed resource is only a scope for the check; session ancestors resolve from core's records.
+      const scope =
+        typeof resource === "string" && resource.startsWith("session:")
+          ? sessionResource(ctx, resource.slice("session:".length))
+          : (resource as string | undefined);
+      const problem = checkIssuer(ctx, rc.caller, cap as string[], scope);
       if (problem !== undefined) return error(problem.status, problem.message);
     } else {
       // spec-gap: without policy@1 nothing declares policy:tag.assign; fall back to an owner with a verified login.
