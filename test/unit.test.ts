@@ -1,25 +1,11 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import type {
-  AuthResult,
-  BeforeEvent,
-  PluginContext,
-  PluginEventBus,
-  PluginStorage,
-  Principal,
-  RequestContext,
-  Role,
-  RouteHandler,
-  ScopeRegistry,
-  Store,
-  ValetEvents,
-} from "@valethq/sdk";
-import { MIGRATIONS, createAuthStore } from "../src/db";
-import plugin, { type AuthConfig } from "../src/index";
+import { createAuthStore, MIGRATIONS } from "../src/db";
+import plugin from "../src/index";
 import { clearCookie, parseCookies, randomSecret, sessionCookie, sha256Hex } from "../src/secrets";
+import { call, cookieOf, fakeContext, ownerCtx } from "./fake";
 
 // ---- pure helpers -----------------------------------------------------------
 
@@ -93,160 +79,18 @@ describe("auth store", () => {
     expect(s.revokeDevice(dev.id)).toBe(false); // already revoked
     expect(s.deviceBySecret("dhash")?.revokedAt).not.toBeNull();
 
-    const tok = s.createToken("pri_1", "thash", "cli");
+    const tok = s.createToken({
+      id: s.newTokenId(),
+      principalId: "pri_1",
+      secretSha256: "thash",
+      name: "cli",
+    });
     expect(s.tokenBySecret("thash")?.id).toBe(tok.id);
     expect(s.listTokens()).toHaveLength(1);
     expect(s.listDevices()).toHaveLength(1);
     expect(s.revokeToken(tok.id)).toBe(true);
   });
 });
-
-// ---- plugin wiring over a fake PluginContext ---------------------------------
-
-interface Fake {
-  ctx: PluginContext<AuthConfig>;
-  routes: Map<string, { handler: RouteHandler; public: boolean }>;
-  authenticate: (req: Request) => AuthResult | undefined | Promise<AuthResult | undefined>;
-  controlRequest: (e: BeforeEvent<"control.request", ValetEvents["control.request"]>) => unknown;
-  logs: { msg: string; data?: Record<string, unknown> }[];
-  emits: { name: string; payload: unknown }[];
-  principals: Map<string, Principal>;
-  dataDir: string;
-  reconfigure: (next: AuthConfig) => Promise<void>;
-}
-
-function fakeContext(config: Record<string, unknown> = {}): Fake {
-  const dataDir = mkdtempSync(join(tmpdir(), "valet-auth-test-"));
-  const db = new Database(":memory:");
-  const routes: Fake["routes"] = new Map();
-  const logs: Fake["logs"] = [];
-  const principals = new Map<string, Principal>();
-  const events: { name: string; fn: (e: never) => unknown }[] = [];
-  const emits: Fake["emits"] = [];
-  let authenticate: Fake["authenticate"] = () => undefined;
-  const listeners: ((next: AuthConfig, prev: AuthConfig) => void | Promise<void>)[] = [];
-
-  const principalByExternal = new Map<string, Principal>();
-  const store = {
-    principals: {
-      get: (id: string) => principals.get(id),
-      resolveIdentity: (platform: string, externalId: string, fallback?: { displayName: string }) => {
-        const key = `${platform}:${externalId}`;
-        const existing = principalByExternal.get(key);
-        if (existing) return existing;
-        const p: Principal = {
-          id: `pri_${principalByExternal.size + 1}`,
-          displayName: fallback?.displayName ?? externalId,
-          role: "guest",
-        };
-        principalByExternal.set(key, p);
-        principals.set(p.id, p);
-        return p;
-      },
-      setRole: async (id: string, role: Role) => {
-        const p = principals.get(id);
-        if (!p) throw new Error(`unknown principal "${id}"`);
-        principals.set(id, { ...p, role });
-      },
-      link: async () => {},
-    },
-  } as unknown as Store;
-
-  const ctx = {
-    plugin: { id: "valet-auth", version: "0.1.0", dir: dataDir, manifest: {} },
-    config,
-    log: {
-      debug: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
-      info: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
-      warn: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
-      error: (msg: string, data?: Record<string, unknown>) => logs.push({ msg, data }),
-    },
-    events: {
-      before: (name: string, fn: (e: never) => unknown) => {
-        events.push({ name, fn });
-        return { active: true, disconnect: () => {} };
-      },
-      emit: async (name: string, payload: unknown) => {
-        emits.push({ name, payload });
-        return { payload, cancelled: false };
-      },
-    } as unknown as PluginEventBus,
-    scopes: {
-      define: () => {},
-      provide: (scope: string, impl: { authenticate?: Fake["authenticate"] }) => {
-        if (scope === "identity" && impl.authenticate !== undefined) {
-          authenticate = impl.authenticate.bind(impl);
-        }
-        return { dispose: () => {} };
-      },
-    } as unknown as ScopeRegistry,
-    store,
-    storage: {
-      kv: {
-        get: () => undefined,
-        set: () => {},
-        delete: () => {},
-        list: () => [],
-      },
-      sql: {
-        migrate: (ms: { id: string; up: string }[]) => {
-          for (const m of ms) db.exec(m.up);
-        },
-        db,
-      },
-    } satisfies PluginStorage,
-    http: {
-      route: (method: string, path: string, handler: RouteHandler, opts?: { public?: boolean }) => {
-        routes.set(`${method} ${path}`, { handler, public: opts?.public ?? false });
-        return { dispose: () => {} };
-      },
-      url: (path: string) => `http://127.0.0.1:7417/plugins/valet-auth${path}`,
-    },
-    ws: { handle: () => ({ dispose: () => {} }), publish: () => {} },
-    secrets: { get: async () => undefined, require: async () => "x" },
-    paths: { data: dataDir, cache: dataDir, valetHome: dataDir },
-    signal: new AbortController().signal,
-    onConfigChange: (fn: (typeof listeners)[number]) => listeners.push(fn),
-    onDispose: () => {},
-  } as unknown as PluginContext<AuthConfig>;
-
-  return {
-    ctx,
-    routes,
-    authenticate: (req) => authenticate(req),
-    controlRequest: (e) => {
-      const hook = events.find((h) => h.name === "control.request");
-      if (!hook) throw new Error("no control.request hook registered");
-      return hook.fn(e as never);
-    },
-    logs,
-    emits,
-    principals,
-    dataDir,
-    reconfigure: async (next) => {
-      const prev = ctx.config;
-      (ctx as { config: AuthConfig }).config = next;
-      for (const fn of listeners) await fn(next, prev);
-    },
-  };
-}
-
-const ownerCtx = (principalId: string): RequestContext => ({
-  caller: { plugin: "core", actor: { principalId, role: "owner" } },
-  principal: { id: principalId, displayName: "o", role: "owner" },
-  params: {},
-  url: new URL("http://127.0.0.1:7417/"),
-});
-
-const call = (f: Fake, key: string, req: Request, rc?: RequestContext) => {
-  const route = f.routes.get(key);
-  if (!route) throw new Error(`route ${key} not registered`);
-  return route.handler(req, rc ?? ownerCtx("pri_1"));
-};
-
-// A Set-Cookie value happens to parse like a Cookie header; attributes just look like extra pairs.
-const cookieOf = (res: Response, name = "valet_session"): string =>
-  parseCookies(res.headers.get("set-cookie"))[name] ?? "";
 
 describe("plugin", () => {
   test("mints a setup token on first boot and logs the setup URL", async () => {
@@ -262,31 +106,26 @@ describe("plugin", () => {
     expect(await status.json()).toEqual({ setupRequired: true });
   });
 
-  test("control.request policy: owner allowed, other roles denied, anonymous untouched", async () => {
+  test("routes declare their permissions and no control.request hook remains", async () => {
     const f = fakeContext();
     await plugin.activate(f.ctx);
-    const mk = (actor?: { principalId: string; role: Role }) => {
-      let denied: string | undefined;
-      const e = {
-        name: "control.request",
-        phase: "before",
-        caller: { plugin: "core", ...(actor ? { actor } : {}) },
-        payload: { kind: "http", method: "GET", path: "/" },
-        cancelled: false,
-        cancelReason: undefined,
-        denied: undefined,
-        cancel: () => {},
-        deny: (r: string) => {
-          denied = r;
-        },
-      } as unknown as BeforeEvent<"control.request", ValetEvents["control.request"]>;
-      f.controlRequest(e);
-      return denied;
-    };
-    expect(mk({ principalId: "p", role: "owner" })).toBeUndefined();
-    expect(mk({ principalId: "p", role: "trusted" })).toBe("valet-auth: owner only on the control plane");
-    expect(mk({ principalId: "p", role: "guest" })).toBe("valet-auth: owner only on the control plane");
-    expect(mk(undefined)).toBeUndefined();
+    const declared = Object.fromEntries(
+      [...f.routes].filter(([, r]) => !r.public).map(([k, r]) => [k, r.permission]),
+    );
+    expect(declared).toEqual({
+      "GET /me": "identity:me",
+      "GET /devices": "identity:device.read",
+      "DELETE /devices/:id": "identity:device.revoke",
+      "POST /tokens": "identity:token.create",
+      "GET /tokens": "identity:token.read",
+      "DELETE /tokens/:id": "identity:token.revoke",
+    });
+    expect(f.hooks).toEqual([]);
+    const me = await call(f, "GET /me", new Request("http://x/me"), {
+      ...ownerCtx("pri_1"),
+      principal: undefined,
+    });
+    expect(me.status).toBe(401);
   });
 
   test("setup, login cookie auth, logout revoke, bearer tokens", async () => {
@@ -323,6 +162,7 @@ describe("plugin", () => {
     expect(await f.authenticate(authReq({ cookie: `valet_session=${cookie}` }))).toEqual({
       principalId,
       credentialId: expect.stringMatching(/^dev_/),
+      verifiedLogin: true,
     });
     expect(await f.authenticate(authReq({ cookie: "valet_session=bogus" }))).toBeUndefined();
 
@@ -334,7 +174,10 @@ describe("plugin", () => {
     const tokRes = await call(
       f,
       "POST /tokens",
-      new Request("http://x/tokens", { method: "POST", body: JSON.stringify({ name: "cli" }) }),
+      new Request("http://x/tokens", {
+        method: "POST",
+        body: JSON.stringify({ name: "cli", cap: ["identity:me"] }),
+      }),
       ownerCtx(principalId),
     );
     expect(tokRes.status).toBe(201);
@@ -342,6 +185,7 @@ describe("plugin", () => {
     expect(await f.authenticate(authReq({ authorization: `Bearer ${token}` }))).toEqual({
       principalId,
       credentialId: tokenId,
+      cap: ["identity:me"],
     });
     const delTok = await call(f, "DELETE /tokens/:id", authReq({}), {
       ...ownerCtx(principalId),

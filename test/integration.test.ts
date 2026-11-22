@@ -154,7 +154,7 @@ describe("kernel integration", () => {
   });
 
   test("bearer token from /tokens authenticates, revokes cleanly", async () => {
-    const res = await post("/plugins/valet-auth/tokens", { name: "cli" }, cookie);
+    const res = await post("/plugins/valet-auth/tokens", { name: "cli", cap: ["core:project.read"] }, cookie);
     expect(res.status).toBe(201);
     const body = (await res.json()) as { id: string; token: string };
     bearer = body.token;
@@ -168,9 +168,13 @@ describe("kernel integration", () => {
       ).status,
     ).toBe(200);
     const listed = (await (await api("/plugins/valet-auth/tokens", {}, cookie)).json()) as {
-      tokens: { id: string; name: string | null }[];
+      tokens: { id: string; cap: string[] | null }[];
     };
-    expect(listed.tokens.map((t) => t.id)).toContain(bearerId);
+    expect(listed.tokens.find((t) => t.id === bearerId)?.cap).toEqual(["core:project.read"]);
+  });
+
+  test("a token without cap or tag is refused", async () => {
+    expect((await post("/plugins/valet-auth/tokens", { name: "bare" }, cookie)).status).toBe(400);
   });
 
   test("a revoked device stops working", async () => {

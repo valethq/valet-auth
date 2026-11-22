@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.",
+  "description": "Identity: owner password, device cookies and scoped bearer tokens.",
   "scripts": {
     "typecheck": "tsc --noEmit -p .",
     "lint": "biome check .",

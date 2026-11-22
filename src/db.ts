@@ -33,6 +33,13 @@ export const MIGRATIONS: { id: string; up: string }[] = [
       );
     `,
   },
+  {
+    id: "0002-token-cap-tag",
+    up: `
+      ALTER TABLE p_auth_tokens ADD COLUMN cap TEXT;
+      ALTER TABLE p_auth_tokens ADD COLUMN tag TEXT;
+    `,
+  },
 ];
 
 export interface OwnerRow {
@@ -50,6 +57,11 @@ export interface CredentialRow {
   revokedAt: number | null;
 }
 
+export interface TokenRow extends CredentialRow {
+  cap: string[] | null;
+  tag: string | null;
+}
+
 interface RawCredential {
   id: string;
   principal_id: string;
@@ -58,6 +70,13 @@ interface RawCredential {
   last_seen_at: number | null;
   revoked_at: number | null;
 }
+
+interface RawToken extends RawCredential {
+  cap: string | null;
+  tag: string | null;
+}
+
+const COLUMNS = "id, principal_id, name, created_at, last_seen_at, revoked_at";
 
 const toCredential = (r: RawCredential): CredentialRow => ({
   id: r.id,
@@ -68,51 +87,43 @@ const toCredential = (r: RawCredential): CredentialRow => ({
   revokedAt: r.revoked_at,
 });
 
+const toToken = (r: RawToken): TokenRow => ({
+  ...toCredential(r),
+  cap: r.cap === null ? null : (JSON.parse(r.cap) as string[]),
+  tag: r.tag,
+});
+
 const newId = (prefix: string): string => `${prefix}_${Bun.randomUUIDv7()}`;
+
+export interface NewToken {
+  id: string;
+  principalId: string;
+  secretSha256: string;
+  name?: string;
+  cap?: string[];
+  tag?: string;
+}
 
 /** Typed access to the plugin's p_auth_* tables (ctx.storage.sql.db). */
 export function createAuthStore(db: Database) {
-  const credential = (table: "devices" | "tokens", column: "id" | "secret_sha256", value: string) =>
-    db
-      .query<RawCredential, string>(
-        `SELECT id, principal_id, name, created_at, last_seen_at, revoked_at
-         FROM p_auth_${table} WHERE ${column} = ?`,
-      )
-      .get(value);
-  const createCredential = (
-    table: "devices" | "tokens",
-    principalId: string,
-    secretSha256: string,
-    name?: string,
-  ) => {
-    const row: CredentialRow = {
-      id: newId(table === "devices" ? "dev" : "tok"),
-      principalId,
-      name: name ?? null,
-      createdAt: Date.now(),
-      lastSeenAt: null,
-      revokedAt: null,
-    };
-    db.query(
-      `INSERT INTO p_auth_${table} (id, principal_id, secret_sha256, name, created_at)
-       VALUES (?, ?, ?, ?, ?)`,
-    ).run(row.id, principalId, secretSha256, row.name, row.createdAt);
-    return row;
-  };
-  const listCredentials = (table: "devices" | "tokens") =>
-    db
-      .query<RawCredential, []>(
-        `SELECT id, principal_id, name, created_at, last_seen_at, revoked_at
-         FROM p_auth_${table} ORDER BY created_at`,
-      )
-      .all()
-      .map(toCredential);
-  const revokeCredential = (table: "devices" | "tokens", id: string) =>
+  const revoke = (table: "devices" | "tokens", id: string) =>
     db
       .query(`UPDATE p_auth_${table} SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL`)
       .run(Date.now(), id).changes > 0;
   const touch = (table: "devices" | "tokens", id: string) =>
     db.query(`UPDATE p_auth_${table} SET last_seen_at = ? WHERE id = ?`).run(Date.now(), id);
+  const device = (column: "id" | "secret_sha256", value: string) => {
+    const row = db
+      .query<RawCredential, string>(`SELECT ${COLUMNS} FROM p_auth_devices WHERE ${column} = ?`)
+      .get(value);
+    return row === null ? undefined : toCredential(row);
+  };
+  const token = (column: "id" | "secret_sha256", value: string) => {
+    const row = db
+      .query<RawToken, string>(`SELECT ${COLUMNS}, cap, tag FROM p_auth_tokens WHERE ${column} = ?`)
+      .get(value);
+    return row === null ? undefined : toToken(row);
+  };
 
   return {
     owner(): OwnerRow | undefined {
@@ -155,25 +166,67 @@ export function createAuthStore(db: Database) {
       db.query("DELETE FROM p_auth_setup").run();
     },
 
-    deviceById: (id: string) => optional(credential("devices", "id", id)),
-    deviceBySecret: (h: string) => optional(credential("devices", "secret_sha256", h)),
-    createDevice: (principalId: string, secretSha256: string, name?: string) =>
-      createCredential("devices", principalId, secretSha256, name),
-    listDevices: () => listCredentials("devices"),
-    revokeDevice: (id: string) => revokeCredential("devices", id),
+    deviceById: (id: string) => device("id", id),
+    deviceBySecret: (h: string) => device("secret_sha256", h),
+    createDevice(principalId: string, secretSha256: string, name?: string): CredentialRow {
+      const row: CredentialRow = {
+        id: newId("dev"),
+        principalId,
+        name: name ?? null,
+        createdAt: Date.now(),
+        lastSeenAt: null,
+        revokedAt: null,
+      };
+      db.query(
+        `INSERT INTO p_auth_devices (id, principal_id, secret_sha256, name, created_at)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(row.id, principalId, secretSha256, row.name, row.createdAt);
+      return row;
+    },
+    listDevices: () =>
+      db
+        .query<RawCredential, []>(`SELECT ${COLUMNS} FROM p_auth_devices ORDER BY created_at`)
+        .all()
+        .map(toCredential),
+    revokeDevice: (id: string) => revoke("devices", id),
     touchDevice: (id: string) => touch("devices", id),
 
-    tokenById: (id: string) => optional(credential("tokens", "id", id)),
-    tokenBySecret: (h: string) => optional(credential("tokens", "secret_sha256", h)),
-    createToken: (principalId: string, secretSha256: string, name?: string) =>
-      createCredential("tokens", principalId, secretSha256, name),
-    listTokens: () => listCredentials("tokens"),
-    revokeToken: (id: string) => revokeCredential("tokens", id),
+    newTokenId: () => newId("tok"),
+    tokenById: (id: string) => token("id", id),
+    tokenBySecret: (h: string) => token("secret_sha256", h),
+    createToken(t: NewToken): TokenRow {
+      const row: TokenRow = {
+        id: t.id,
+        principalId: t.principalId,
+        name: t.name ?? null,
+        createdAt: Date.now(),
+        lastSeenAt: null,
+        revokedAt: null,
+        cap: t.cap ?? null,
+        tag: t.tag ?? null,
+      };
+      db.query(
+        `INSERT INTO p_auth_tokens (id, principal_id, secret_sha256, name, created_at, cap, tag)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        row.id,
+        row.principalId,
+        t.secretSha256,
+        row.name,
+        row.createdAt,
+        row.cap === null ? null : JSON.stringify(row.cap),
+        row.tag,
+      );
+      return row;
+    },
+    listTokens: () =>
+      db
+        .query<RawToken, []>(`SELECT ${COLUMNS}, cap, tag FROM p_auth_tokens ORDER BY created_at`)
+        .all()
+        .map(toToken),
+    revokeToken: (id: string) => revoke("tokens", id),
     touchToken: (id: string) => touch("tokens", id),
   };
 }
-
-const optional = (r: RawCredential | null): CredentialRow | undefined =>
-  r === null ? undefined : toCredential(r);
 
 export type AuthStore = ReturnType<typeof createAuthStore>;
