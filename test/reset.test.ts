@@ -13,7 +13,7 @@ test("reset clears the owner, revokes devices and tokens, and mints a usable set
   const store = createAuthStore(db);
   store.createOwner("pri_1", "hash");
   const device = store.createDevice("pri_1", "d1", "phone");
-  const token = store.createToken("pri_1", "t1");
+  const token = store.createToken({ id: store.newTokenId(), principalId: "pri_1", secretSha256: "t1" });
 
   const tokenFile = join(mkdtempSync(join(tmpdir(), "valet-reset-")), "data", "setup-token");
   const setup = resetOwner(db, tokenFile);

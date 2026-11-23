@@ -38,6 +38,10 @@ function stagePlugin(pluginsDir: string): void {
   cpSync(join(REPO, "src"), join(dest, "src"), { recursive: true });
   cpSync(join(REPO, "manifest.json"), join(dest, "manifest.json"));
   symlinkSync(SDK_DIR, join(dest, "node_modules", "@valethq", "sdk"));
+  const policy = join(pluginsDir, "valet-fixture-policy");
+  mkdirSync(join(policy, "node_modules", "@valethq"), { recursive: true });
+  cpSync(join(REPO, "test", "fixtures", "valet-fixture-policy"), policy, { recursive: true });
+  symlinkSync(SDK_DIR, join(policy, "node_modules", "@valethq", "sdk"));
 }
 
 async function api(path: string, init: RequestInit = {}, cookie?: string): Promise<Response> {
@@ -154,7 +158,7 @@ describe("kernel integration", () => {
   });
 
   test("bearer token from /tokens authenticates, revokes cleanly", async () => {
-    const res = await post("/plugins/valet-auth/tokens", { name: "cli" }, cookie);
+    const res = await post("/plugins/valet-auth/tokens", { name: "cli", cap: ["core:project.read"] }, cookie);
     expect(res.status).toBe(201);
     const body = (await res.json()) as { id: string; token: string };
     bearer = body.token;
@@ -168,9 +172,13 @@ describe("kernel integration", () => {
       ).status,
     ).toBe(200);
     const listed = (await (await api("/plugins/valet-auth/tokens", {}, cookie)).json()) as {
-      tokens: { id: string; name: string | null }[];
+      tokens: { id: string; cap: string[] | null }[];
     };
-    expect(listed.tokens.map((t) => t.id)).toContain(bearerId);
+    expect(listed.tokens.find((t) => t.id === bearerId)?.cap).toEqual(["core:project.read"]);
+  });
+
+  test("a token without cap or tag is refused", async () => {
+    expect((await post("/plugins/valet-auth/tokens", { name: "bare" }, cookie)).status).toBe(400);
   });
 
   test("a revoked device stops working", async () => {
@@ -213,5 +221,34 @@ describe("kernel integration", () => {
     expect(res.headers.get("set-cookie")).toContain("Max-Age=0");
     expect((await api("/api/core/projects", {}, cookie)).status).toBe(401);
     expect((await post("/plugins/valet-auth/setup", { token: "x", password: "y" })).status).toBe(409);
+  });
+
+  test("the route gate and the scoped issuer check both reach the policy", async () => {
+    const login = await post("/plugins/valet-auth/login", {
+      password: "correct horse battery staple",
+    });
+    const c3 = cookieOf(login);
+    const mint = (body: unknown) => post("/plugins/valet-auth/tokens", body, c3);
+    const deny = (permission: string, resource: string) =>
+      post("/plugins/valet-fixture-policy/deny", { permission, resource });
+
+    // The handler's scoped can() reaches the policy with the claimed resource.
+    expect((await deny("core:project.read", "project:prj_denied")).status).toBe(200);
+    expect(
+      (
+        await mint({
+          name: "denied",
+          cap: ["core:project.read"],
+          resource: "project:prj_denied",
+        })
+      ).status,
+    ).toBe(403);
+    expect((await mint({ name: "ok", cap: ["core:project.read"], resource: "project:prj_ok" })).status).toBe(
+      201,
+    );
+
+    // Denying the unscoped route permission stops the request before the handler runs.
+    expect((await deny("identity:token.create", "*")).status).toBe(200);
+    expect((await mint({ name: "late", cap: ["core:project.read"] })).status).toBe(403);
   });
 });

@@ -3,10 +3,11 @@
   "id": "valet-auth",
   "name": "Auth",
   "version": "0.1.0",
-  "description": "Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.",
-  "valet": "^0.1.0",
+  "description": "Identity: owner password, device cookies and scoped bearer tokens.",
+  "valet": "^0.1.1",
   "main": "./src/index.ts",
   "provides": ["identity@1", "settings@2"],
+  "optionalRequires": ["transport@1"],
   "events": {
     "namespace": "identity"
   },
@@ -31,6 +32,32 @@
           }
         ],
         "icon": "lock"
+      }
+    }
+  },
+  "acl": {
+    "permissions": {
+      "device.read": {
+        "summary": "List login devices."
+      },
+      "device.revoke": {
+        "summary": "Revoke a login device.",
+        "requireVerifiedLogin": true
+      },
+      "token.read": {
+        "summary": "List bearer tokens."
+      },
+      "token.create": {
+        "summary": "Create a capped or tagged bearer token.",
+        "requireVerifiedLogin": true
+      },
+      "token.revoke": {
+        "summary": "Revoke a bearer token.",
+        "requireVerifiedLogin": true
+      },
+      "me": {
+        "summary": "Read your own principal.",
+        "default": "guest"
       }
     }
   }

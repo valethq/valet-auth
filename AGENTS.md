@@ -1,6 +1,6 @@
 # valet-auth
 
-Identity (owner password, device cookies, bearer tokens) and the default control-plane policy.
+Identity (owner password, device cookies, scoped bearer tokens).
 
 Rules for this repo. The contract lives in `../valet-core`.
 

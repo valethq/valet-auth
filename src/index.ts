@@ -1,39 +1,15 @@
 import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  type AuthResult,
-  definePlugin,
-  type PluginContext,
-  type Principal,
-  type RequestContext,
-} from "@valethq/sdk";
-import { MIGRATIONS, createAuthStore } from "./db";
+import { definePlugin, type PluginContext } from "@valethq/sdk";
+import { createAuthStore, MIGRATIONS } from "./db";
+import { createIdentityProvider } from "./provider";
+import { error, json, jsonBody } from "./respond";
 import { clearCookie, parseCookies, randomSecret, sessionCookie, sha256Hex } from "./secrets";
 import { registerSettings } from "./settings";
+import { createToken } from "./tokens";
 
 export interface AuthConfig {
   cookieName?: string;
-}
-
-const json = (data: unknown, status = 200, headers: Record<string, string> = {}): Response =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: { "content-type": "application/json", ...headers },
-  });
-
-const error = (status: number, message: string): Response => json({ error: { message } }, status);
-
-async function jsonBody(req: Request): Promise<Record<string, unknown>> {
-  const text = await req.text();
-  if (text === "") return {};
-  try {
-    const parsed: unknown = JSON.parse(text);
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
-      ? (parsed as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 export default definePlugin<AuthConfig>({
@@ -134,96 +110,57 @@ export default definePlugin<AuthConfig>({
       { public: true },
     );
 
-    // ---- owner routes ---------------------------------------------------------
+    // ---- permissioned routes (core enforces `permission` before the handler) ---
 
-    const requireOwner = (rc: RequestContext): Principal | Response => {
-      const p = rc.principal;
-      return p === undefined || p.role !== "owner" ? error(403, "owner only") : p;
-    };
+    ctx.http.route(
+      "GET",
+      "/me",
+      (_req, rc) =>
+        rc.principal === undefined
+          ? error(401, "authentication required")
+          : json({ principal: rc.principal }),
+      { permission: "identity:me" },
+    );
 
-    ctx.http.route("GET", "/me", (_req, rc) => {
-      const p = requireOwner(rc);
-      return p instanceof Response ? p : json({ principal: p });
+    ctx.http.route("GET", "/devices", () => json({ devices: store.listDevices() }), {
+      permission: "identity:device.read",
     });
 
-    ctx.http.route("GET", "/devices", (_req, rc) => {
-      const p = requireOwner(rc);
-      return p instanceof Response ? p : json({ devices: store.listDevices() });
-    });
-
-    ctx.http.route("DELETE", "/devices/:id", async (_req, rc) => {
-      const p = requireOwner(rc);
-      if (p instanceof Response) return p;
-      const device = store.deviceById(rc.params.id ?? "");
-      if (device === undefined || !store.revokeDevice(device.id)) {
-        return error(404, "unknown device");
-      }
-      await ctx.events.emit("identity.changed", { principalId: device.principalId });
-      return json({ ok: true });
-    });
-
-    ctx.http.route("POST", "/tokens", async (req, rc) => {
-      const p = requireOwner(rc);
-      if (p instanceof Response) return p;
-      const b = await jsonBody(req);
-      const name = typeof b.name === "string" && b.name !== "" ? b.name : undefined;
-      const secret = randomSecret();
-      const row = store.createToken(p.id, sha256Hex(secret), name);
-      return json({ id: row.id, token: secret }, 201);
-    });
-
-    ctx.http.route("GET", "/tokens", (_req, rc) => {
-      const p = requireOwner(rc);
-      return p instanceof Response ? p : json({ tokens: store.listTokens() });
-    });
-
-    ctx.http.route("DELETE", "/tokens/:id", async (_req, rc) => {
-      const p = requireOwner(rc);
-      if (p instanceof Response) return p;
-      const token = store.tokenById(rc.params.id ?? "");
-      if (token === undefined || !store.revokeToken(token.id)) {
-        return error(404, "unknown token");
-      }
-      await ctx.events.emit("identity.changed", { principalId: token.principalId });
-      return json({ ok: true });
-    });
-
-    // ---- identity@1 ------------------------------------------------------------
-
-    ctx.scopes.provide("identity", {
-      authenticate(req): AuthResult | undefined {
-        const authz = req.headers.get("authorization");
-        if (authz?.toLowerCase().startsWith("bearer ")) {
-          const secret = authz.slice(7).trim();
-          if (secret !== "") {
-            const token = store.tokenBySecret(sha256Hex(secret));
-            if (token !== undefined && token.revokedAt === null) {
-              store.touchToken(token.id);
-              return { principalId: token.principalId, credentialId: token.id };
-            }
-          }
-        }
-        const secret = parseCookies(req.headers.get("cookie"))[cookieName];
-        if (secret !== undefined && secret !== "") {
-          const device = store.deviceBySecret(sha256Hex(secret));
-          if (device !== undefined && device.revokedAt === null) {
-            store.touchDevice(device.id);
-            return { principalId: device.principalId, credentialId: device.id };
-          }
-        }
-        return undefined;
+    ctx.http.route(
+      "DELETE",
+      "/devices/:id",
+      async (_req, rc) => {
+        const device = store.deviceById(rc.params.id ?? "");
+        if (device === undefined || !store.revokeDevice(device.id)) return error(404, "unknown device");
+        await ctx.events.emit("identity.changed", { principalId: device.principalId });
+        return json({ ok: true });
       },
+      { permission: "identity:device.revoke" },
+    );
+
+    ctx.http.route("POST", "/tokens", createToken(ctx, store), { permission: "identity:token.create" });
+
+    ctx.http.route("GET", "/tokens", () => json({ tokens: store.listTokens() }), {
+      permission: "identity:token.read",
     });
+
+    ctx.http.route(
+      "DELETE",
+      "/tokens/:id",
+      async (_req, rc) => {
+        const token = store.tokenById(rc.params.id ?? "");
+        if (token === undefined || !store.revokeToken(token.id)) return error(404, "unknown token");
+        await ctx.events.emit("identity.changed", { principalId: token.principalId });
+        return json({ ok: true });
+      },
+      { permission: "identity:token.revoke" },
+    );
+
+    ctx.scopes.provide(
+      "identity",
+      createIdentityProvider(store, () => cookieName),
+    );
 
     registerSettings(ctx, store);
-
-    // ---- default control-plane policy (11.7): owner only -----------------------
-
-    ctx.events.before("control.request", (e) => {
-      const role = e.caller.actor?.role;
-      if (role !== undefined && role !== "owner") {
-        e.deny("valet-auth: owner only on the control plane");
-      }
-    });
   },
 });
